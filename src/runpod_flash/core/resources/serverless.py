@@ -27,7 +27,6 @@ from .constants import (
     DEFAULT_WORKERS_MIN,
     validate_python_version as _validate_python_version,
 )
-from .environment import EnvironmentVars
 from .cpu import CpuInstanceType
 from .gpu import GpuGroup, GpuType
 from .network_volume import NetworkVolume, DataCenter, CPU_DATACENTERS
@@ -37,18 +36,6 @@ from .resource_manager import ResourceManager
 
 # Prefix applied to endpoint names during live provisioning
 LIVE_PREFIX = "live-"
-
-
-# Environment variables are loaded from the .env file
-def get_env_vars() -> Dict[str, str]:
-    """
-    Returns the environment variables from the .env file.
-    {
-        "KEY": "VALUE",
-    }
-    """
-    env_vars = EnvironmentVars()
-    return env_vars.get_env()
 
 
 log = logging.getLogger(__name__)
@@ -149,7 +136,7 @@ class ServerlessResource(DeployableResource):
 
     # === Input-only Fields ===
     cudaVersions: Optional[List[CudaVersion]] = []  # for allowedCudaVersions
-    env: Optional[Dict[str, str]] = Field(default_factory=get_env_vars)
+    env: Optional[Dict[str, str]] = Field(default=None)
     flashboot: Optional[bool] = True
     gpus: Optional[List[GpuGroup | GpuType]] = [GpuGroup.ANY]  # for gpuIds
     imageName: Optional[str] = ""  # for template.imageName
@@ -331,8 +318,9 @@ class ServerlessResource(DeployableResource):
     def config_hash(self) -> str:
         """Get config hash excluding runtime-assigned fields.
 
-        Prevents false drift from:
-        - Runtime-assigned fields (template, templateId, aiKey, userId, etc.)
+        Fields that are None are excluded via exclude_none. When env is None
+        (default), it is not included in the hash. When env is explicitly set,
+        it IS included and triggers drift detection.
 
         Hashes user-specified configuration including env vars.
         """
@@ -551,7 +539,7 @@ class ServerlessResource(DeployableResource):
         return PodTemplate(
             name=self.resource_id,
             imageName=self.imageName,
-            env=KeyValuePair.from_dict(self.env or get_env_vars()),
+            env=KeyValuePair.from_dict(self.env or {}),
         )
 
     def _configure_existing_template(self) -> None:
@@ -563,8 +551,12 @@ class ServerlessResource(DeployableResource):
 
         if self.imageName:
             self.template.imageName = self.imageName
-        if self.env:
-            self.template.env = KeyValuePair.from_dict(self.env)
+        if self.env is not None:
+            has_explicit_template_env = "env" in getattr(
+                self.template, "model_fields_set", set()
+            )
+            if self.env or not has_explicit_template_env:
+                self.template.env = KeyValuePair.from_dict(self.env)
 
     async def _sync_graphql_object_with_inputs(
         self, returned_endpoint: "ServerlessResource"
@@ -842,6 +834,55 @@ class ServerlessResource(DeployableResource):
                 self._inject_template_env("FLASH_MODULE_PATH", module_path)
                 log.debug(f"{self.name}: Injected FLASH_MODULE_PATH={module_path}")
 
+    async def _preserve_platform_env(
+        self,
+        client: "RunpodGraphQLClient",
+        template_id: str,
+        old_env: Optional[Dict[str, str]] = None,
+    ) -> None:
+        """Read current template env and re-add platform-injected vars.
+
+        The platform injects env vars (e.g. PORT, PORT_HEALTH) once at
+        initial deploy and does not re-inject them on saveTemplate.  When
+        we send a full env replacement we must carry those vars forward.
+
+        A live template key is considered platform-injected only if it
+        was NOT in the previous user config (old_env).  Keys that were
+        in old_env but are absent from the new config were intentionally
+        removed by the user and must not be resurrected.
+        """
+        if self.template is None:
+            return
+
+        try:
+            live = await client.get_template(template_id)
+        except Exception:
+            log.debug(
+                f"{self.name}: Could not fetch template '{template_id}', "
+                f"skipping platform env preservation"
+            )
+            return
+
+        live_env = live.get("env") or []
+        if not live_env:
+            return
+
+        new_keys = {kv.key for kv in (self.template.env or [])}
+        old_keys = set(old_env or {})
+        for entry in live_env:
+            key = entry.get("key", "")
+            if not key or key in new_keys:
+                continue
+            # Key was in old user config — user intentionally removed it
+            if key in old_keys:
+                log.debug(f"{self.name}: User removed env var '{key}', not preserving")
+                continue
+            self.template.env = self.template.env or []
+            self.template.env.append(
+                KeyValuePair(key=key, value=entry.get("value", ""))
+            )
+            log.debug(f"{self.name}: Preserved platform env var '{key}'")
+
     async def _do_deploy(self) -> "DeployableResource":
         """
         Deploys the serverless resource using the provided configuration.
@@ -957,6 +998,13 @@ class ServerlessResource(DeployableResource):
                             # Inject runtime vars (RUNPOD_API_KEY, FLASH_MODULE_PATH)
                             # so they survive the template env overwrite.
                             new_config._inject_runtime_template_vars()
+
+                            # Preserve platform-injected env vars (e.g. PORT,
+                            # PORT_HEALTH) that the platform sets once at initial
+                            # deploy and does not re-inject on template updates.
+                            await new_config._preserve_platform_env(
+                                client, resolved_template_id, self.env
+                            )
 
                         template_payload = self._build_template_update_payload(
                             new_config.template,
